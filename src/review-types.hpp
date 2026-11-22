@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -38,11 +39,33 @@ enum class AnnotationType {
   Signature,
 };
 
+enum class TextAlign {
+  Left,
+  Center,
+  Right,
+};
+
+struct TextStyle {
+  bool bold{};
+  bool italic{};
+  bool underline{};
+  Color color{};
+  std::string font_family{"Sans"};
+  double font_size{12.0};
+};
+
+struct TextSpan {
+  std::size_t start{};
+  std::size_t end{};
+  TextStyle style{};
+};
+
 struct Annotation {
   std::uint64_t id{};
   AnnotationType type{AnnotationType::Rectangle};
   Rect bounds{};                  // PDF points in unrotated page coordinates
   std::vector<Point> points{};    // ink path or line endpoints
+  std::vector<Rect> text_rects{}; // per-line text-highlight rectangles
   std::string text{};
   std::string signature_path{};
   Color stroke{};
@@ -50,6 +73,11 @@ struct Annotation {
   double stroke_width{2.0};
   std::string font_family{"Sans"};
   double font_size{12.0};
+  bool bold{};
+  bool italic{};
+  bool underline{};
+  TextAlign align{TextAlign::Left};
+  std::vector<TextSpan> text_spans{};
 };
 
 struct Crop {

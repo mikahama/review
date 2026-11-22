@@ -23,6 +23,22 @@ std::string fixture_pdf() {
   return path;
 }
 
+std::string fixture_text_pdf() {
+  const auto path = (std::filesystem::temp_directory_path() /
+                     ("review-text-test-" + std::to_string(g_get_monotonic_time()) + ".pdf")).string();
+  cairo_surface_t* surface = cairo_pdf_surface_create(path.c_str(), 320, 200);
+  cairo_t* cr = cairo_create(surface);
+  cairo_set_source_rgb(cr, 1, 1, 1); cairo_paint(cr);
+  cairo_set_source_rgb(cr, .05, .05, .05);
+  cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+  cairo_set_font_size(cr, 24);
+  cairo_move_to(cr, 40, 100);
+  cairo_show_text(cr, "Hello");
+  cairo_show_page(cr);
+  cairo_destroy(cr); cairo_surface_destroy(surface);
+  return path;
+}
+
 void assert_annotation_appearances(const std::string& pdf_path) {
   const auto qdf_path = pdf_path + ".qdf.pdf";
   gchar* argv[] = {
@@ -65,6 +81,9 @@ void assert_annotation_appearances(const std::string& pdf_path) {
   g_assert_cmpuint(free_text_end, !=, std::string::npos);
   const auto free_text_object = qdf.substr(free_text_start, free_text_end - free_text_start);
   g_assert_nonnull(g_strstr_len(free_text_object.data(), free_text_object.size(), "/AP"));
+  g_assert_nonnull(g_strstr_len(free_text_object.data(), free_text_object.size(),
+                               "/Helvetica-Bold"));
+  g_assert_nonnull(g_strstr_len(free_text_object.data(), free_text_object.size(), "/Q 1"));
   g_unlink(qdf_path.c_str());
 }
 
@@ -116,9 +135,26 @@ void annotation_edit_properties() {
   edited.font_family = "Serif";
   edited.font_size = 18;
   edited.stroke = {0.1, 0.2, 0.8, 1.0};
+  edited.bold = true;
+  edited.italic = true;
+  edited.underline = true;
+  edited.align = review::TextAlign::Center;
+  review::TextStyle span_style;
+  span_style.bold = true;
+  span_style.color = {0.2, 0.4, 0.6, 1.0};
+  span_style.font_family = "Serif";
+  span_style.font_size = 18;
+  edited.text_spans = {{0, 4, span_style}};
   g_assert_true(doc.update_annotation(0, id, edited));
   g_assert_cmpstr(doc.page(0).annotations.front().text.c_str(), ==, "Edited");
   g_assert_cmpstr(doc.page(0).annotations.front().font_family.c_str(), ==, "Serif");
+  g_assert_true(doc.page(0).annotations.front().bold);
+  g_assert_true(doc.page(0).annotations.front().italic);
+  g_assert_true(doc.page(0).annotations.front().underline);
+  g_assert_true(doc.page(0).annotations.front().align == review::TextAlign::Center);
+  g_assert_cmpuint(doc.page(0).annotations.front().text_spans.size(), ==, 1);
+  g_assert_cmpuint(doc.page(0).annotations.front().text_spans.front().end, ==, 4);
+  g_assert_true(doc.page(0).annotations.front().text_spans.front().style.bold);
   g_assert_true(doc.undo());
   g_assert_cmpstr(doc.page(0).annotations.front().text.c_str(), ==, "Original");
 
@@ -129,6 +165,69 @@ void annotation_edit_properties() {
   g_assert_true(doc.undo());
   g_assert_cmpfloat(doc.page(0).annotations.front().bounds.x, ==, 20);
   g_unlink(fixture.c_str());
+}
+
+void move_annotation_between_pages() {
+  const auto path = fixture_pdf();
+  review::Document doc;
+  std::string error;
+  g_assert_true(doc.open(path, error));
+  auto pages = doc.copy_pages({0});
+  doc.insert_pages(pages, 1);
+  g_assert_cmpuint(doc.page_count(), ==, 2);
+
+  review::Annotation annotation;
+  annotation.type = review::AnnotationType::Rectangle;
+  annotation.bounds = {20, 30, 80, 50};
+  doc.add_annotation(0, annotation);
+  const auto id = doc.page(0).annotations.front().id;
+
+  auto moved = doc.page(0).annotations.front();
+  moved.bounds.x += 40;
+  g_assert_true(doc.move_annotation(0, id, 1, moved));
+  g_assert_cmpuint(doc.page(0).annotations.size(), ==, 0);
+  g_assert_cmpuint(doc.page(1).annotations.size(), ==, 1);
+  g_assert_cmpuint(doc.page(1).annotations.front().id, ==, id);
+  g_assert_cmpfloat(doc.page(1).annotations.front().bounds.x, ==, 60);
+  g_unlink(path.c_str());
+}
+
+void highlight_uses_text_layout() {
+  const auto path = fixture_text_pdf();
+  review::Document doc;
+  std::string error;
+  g_assert_true(doc.open(path, error));
+  const auto rects = doc.highlight_rects(0, {30, 90}, {250, 90});
+  g_assert_cmpuint(rects.size(), >=, 1);
+  g_assert_cmpfloat(rects.front().width, >, 0);
+  g_assert_cmpfloat(rects.front().height, >, 0);
+  const auto reversed = doc.highlight_rects(0, {250, 90}, {30, 90});
+  g_assert_cmpuint(reversed.size(), ==, rects.size());
+  g_assert_cmpfloat(reversed.front().width, ==, rects.front().width);
+  g_unlink(path.c_str());
+}
+
+void erase_highlight_range() {
+  const auto path = fixture_pdf();
+  review::Document doc;
+  std::string error;
+  g_assert_true(doc.open(path, error));
+  review::Annotation highlight;
+  highlight.type = review::AnnotationType::Highlight;
+  highlight.bounds = {20, 20, 100, 10};
+  highlight.text_rects = {{20, 20, 100, 10}};
+  doc.add_annotation(0, highlight);
+  g_assert_cmpuint(doc.page(0).annotations.size(), ==, 1);
+
+  g_assert_true(doc.erase_highlights(0, {{50, 20, 40, 10}}));
+  const auto& trimmed = doc.page(0).annotations.front();
+  g_assert_cmpuint(trimmed.text_rects.size(), ==, 2);
+  g_assert_cmpfloat(trimmed.text_rects.front().width, ==, 30);
+  g_assert_cmpfloat(trimmed.text_rects.back().width, ==, 30);
+
+  g_assert_true(doc.erase_highlights(0, {{0, 0, 200, 100}}));
+  g_assert_cmpuint(doc.page(0).annotations.size(), ==, 0);
+  g_unlink(path.c_str());
 }
 
 void crop_is_destructive() {
@@ -162,6 +261,26 @@ void page_operations() {
   g_unlink(path.c_str());
 }
 
+void text_wraps_to_bounds() {
+  const auto path = fixture_pdf();
+  const auto output = path + ".wrap.pdf";
+  review::Document doc;
+  std::string error;
+  g_assert_true(doc.open(path, error));
+  review::Annotation text;
+  text.type = review::AnnotationType::TextBox;
+  text.bounds = {20, 20, 80, 20};
+  text.text = "A long line of text that must wrap inside a narrow text box.";
+  text.font_size = 14;
+  doc.add_annotation(0, text);
+  const auto& saved = doc.page(0).annotations.back();
+  g_assert_cmpfloat(saved.bounds.width, ==, 80);
+  g_assert_cmpfloat(saved.bounds.height, >, 20);
+  g_assert_true(doc.save(output, error));
+  g_unlink(path.c_str());
+  g_unlink(output.c_str());
+}
+
 void save_annotations() {
   const auto path = fixture_pdf();
   const auto output = path + ".saved.pdf";
@@ -175,9 +294,19 @@ void save_annotations() {
   text.font_family = "Sans";
   text.font_size = 32;
   text.stroke = {0.1, 0.2, 0.75, 1.0};
+  text.bold = true;
+  text.underline = true;
+  text.align = review::TextAlign::Center;
+  review::TextStyle span;
+  span.bold = true;
+  span.italic = true;
+  span.color = {0.8, 0.1, 0.1, 1.0};
+  span.font_family = "Serif";
+  span.font_size = 24;
+  text.text_spans = {{0, 8, span}};
   doc.add_annotation(0, text);
   const auto saved_text = doc.page(0).annotations.back();
-  g_assert_cmpfloat(saved_text.bounds.width, >, text.bounds.width);
+  g_assert_cmpfloat(saved_text.bounds.width, ==, text.bounds.width);
   g_assert_cmpfloat(saved_text.bounds.height, >, text.bounds.height);
 
   review::Annotation square;
@@ -191,6 +320,13 @@ void save_annotations() {
   circle.type = review::AnnotationType::Ellipse;
   circle.bounds = {130, 20, 50, 35};
   doc.add_annotation(0, circle);
+
+  review::Annotation marker;
+  marker.type = review::AnnotationType::Highlight;
+  marker.bounds = {60, 70, 120, 28};
+  marker.fill = {1.0, 0.92, 0.23, 0.35};
+  marker.text_rects = {{60, 70, 100, 12}, {60, 86, 80, 12}};
+  doc.add_annotation(0, marker);
 
   review::Annotation ink;
   ink.type = review::AnnotationType::Ink;
@@ -227,9 +363,11 @@ void save_annotations() {
   GList* annotations = poppler_page_get_annot_mapping(page);
   g_assert_nonnull(annotations);
   int squares = 0, circles = 0, free_texts = 0, text_notes = 0, inks = 0, stamps = 0;
+  int highlights = 0;
   for (GList* item = annotations; item; item = item->next) {
     auto* mapping = static_cast<PopplerAnnotMapping*>(item->data);
     switch (poppler_annot_get_annot_type(mapping->annot)) {
+      case POPPLER_ANNOT_HIGHLIGHT: ++highlights; break;
       case POPPLER_ANNOT_SQUARE: {
         ++squares;
         auto* interior = poppler_annot_square_get_interior_color(
@@ -271,6 +409,7 @@ void save_annotations() {
   }
   g_assert_cmpint(squares, ==, 1);
   g_assert_cmpint(circles, ==, 1);
+  g_assert_cmpint(highlights, ==, 1);
   g_assert_cmpint(free_texts, ==, 1);
   g_assert_cmpint(text_notes, ==, 0);
 #ifdef HAVE_POPPLER_INK_API
@@ -312,8 +451,12 @@ int main(int argc, char** argv) {
   g_test_add_func("/document/open-render", open_and_render);
   g_test_add_func("/document/annotation-undo-redo", annotation_undo_redo);
   g_test_add_func("/document/annotation-edit-properties", annotation_edit_properties);
+  g_test_add_func("/document/move-annotation-between-pages", move_annotation_between_pages);
+  g_test_add_func("/document/highlight-text-layout", highlight_uses_text_layout);
+  g_test_add_func("/document/erase-highlight", erase_highlight_range);
   g_test_add_func("/document/secure-crop", crop_is_destructive);
   g_test_add_func("/document/page-operations", page_operations);
+  g_test_add_func("/document/text-wrap", text_wraps_to_bounds);
   g_test_add_func("/document/save-annotations", save_annotations);
   g_test_add_func("/document/rasterize-color", rasterized_page_has_no_text);
   return g_test_run();

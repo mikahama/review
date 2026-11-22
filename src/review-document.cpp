@@ -1,4 +1,5 @@
 #include "review-document.hpp"
+#include "review-text.hpp"
 
 #include <cairo-pdf.h>
 #include <gio/gio.h>
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -63,32 +65,9 @@ bool run_process(const std::vector<std::string>& args, std::string& error) {
 
 Rect fit_text_bounds(const Annotation& annotation) {
   Rect fitted = annotation.bounds;
-  auto* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-  auto* cr = cairo_create(surface);
-  cairo_select_font_face(cr,
-                         annotation.font_family.empty() ? "Sans" : annotation.font_family.c_str(),
-                         CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-  cairo_set_font_size(cr, annotation.font_size);
-  cairo_font_extents_t font{};
-  cairo_font_extents(cr, &font);
-
-  double widest = 0.0;
-  std::size_t lines = 0;
-  std::istringstream input(annotation.text.empty() ? " " : annotation.text);
-  std::string line;
-  while (std::getline(input, line)) {
-    cairo_text_extents_t text{};
-    cairo_text_extents(cr, line.c_str(), &text);
-    widest = std::max(widest, std::max(text.x_advance, text.x_bearing + text.width));
-    ++lines;
-  }
-  if (lines == 0) lines = 1;
-  fitted.width = std::max(fitted.width, std::ceil(widest + 8.0));
+  fitted.width = std::max(fitted.width, 24.0);
   fitted.height = std::max(
-      fitted.height, std::ceil(font.ascent + font.descent +
-                               (lines - 1) * std::max(font.height, annotation.font_size) + 8.0));
-  cairo_destroy(cr);
-  cairo_surface_destroy(surface);
+      fitted.height, std::ceil(measure_text_height(annotation, fitted.width) + 8.0));
   return fitted;
 }
 
@@ -118,6 +97,30 @@ std::string pdf_utf16_string(const std::string& text) {
 std::string pdf_number(double value) {
   char buffer[G_ASCII_DTOSTR_BUF_SIZE];
   return g_ascii_dtostr(buffer, sizeof(buffer), value);
+}
+
+std::string pdf_font_name(const Annotation& annotation) {
+  const bool mono = annotation.font_family.find("Mono") != std::string::npos;
+  const bool serif = annotation.font_family.find("Serif") != std::string::npos;
+  std::string font;
+  if (mono) {
+    font = "Courier";
+    if (annotation.bold && annotation.italic) font += "-BoldOblique";
+    else if (annotation.bold) font += "-Bold";
+    else if (annotation.italic) font += "-Oblique";
+  } else if (serif) {
+    font = "Times";
+    if (annotation.bold && annotation.italic) font += "-BoldItalic";
+    else if (annotation.bold) font += "-Bold";
+    else if (annotation.italic) font += "-Italic";
+    else font += "-Roman";
+  } else {
+    font = "Helvetica";
+    if (annotation.bold && annotation.italic) font += "-BoldOblique";
+    else if (annotation.bold) font += "-Bold";
+    else if (annotation.italic) font += "-Oblique";
+  }
+  return "/" + font;
 }
 
 bool convert_saved_free_text(const std::string& path,
@@ -170,14 +173,14 @@ bool convert_saved_free_text(const std::string& path,
                   "/Contents " + pdf_utf16_string(annotation.text));
       subtype = qdf.find("/Subtype /Stamp", contents);
       qdf.replace(subtype, std::strlen("/Subtype /Stamp"), "/Subtype /FreeText");
-      const auto font = annotation.font_family.find("Mono") != std::string::npos ? "/Courier" :
-                        annotation.font_family.find("Serif") != std::string::npos ? "/Times-Roman" :
-                                                                                   "/Helvetica";
-      const auto appearance = std::string("\n  /DA (") + font + " " +
+      const int alignment = annotation.align == TextAlign::Center ? 1 :
+                            annotation.align == TextAlign::Right ? 2 : 0;
+      const auto appearance = std::string("\n  /DA (") + pdf_font_name(annotation) + " " +
                               pdf_number(annotation.font_size) +
                               " Tf " + pdf_number(annotation.stroke.red) + " " +
                               pdf_number(annotation.stroke.green) + " " +
-                              pdf_number(annotation.stroke.blue) + " rg)\n  /Q 0";
+                              pdf_number(annotation.stroke.blue) + " rg)\n  /Q " +
+                              std::to_string(alignment);
       qdf.insert(subtype + std::strlen("/Subtype /FreeText"), appearance);
     }
   }
@@ -217,11 +220,21 @@ void paint_pixbuf(cairo_t* cr, GdkPixbuf* pixbuf, double x, double y,
     auto* out = reinterpret_cast<std::uint32_t*>(destination + py * destination_stride);
     const auto* in = source + py * source_stride;
     for (int px = 0; px < pw; ++px) {
-      const unsigned alpha = channels == 4 ? in[px * channels + 3] : 255;
-      const unsigned red = in[px * channels] * alpha / 255;
-      const unsigned green = in[px * channels + 1] * alpha / 255;
-      const unsigned blue = in[px * channels + 2] * alpha / 255;
-      out[px] = (alpha << 24) | (red << 16) | (green << 8) | blue;
+      unsigned red = 0;
+      unsigned green = 0;
+      unsigned blue = 0;
+      unsigned alpha = 255;
+      if (channels == 1 || channels == 2) {
+        red = green = blue = in[px * channels];
+        if (channels == 2) alpha = in[px * channels + 1];
+      } else {
+        red = in[px * channels];
+        green = in[px * channels + 1];
+        blue = in[px * channels + 2];
+        if (channels == 4) alpha = in[px * channels + 3];
+      }
+      out[px] = ((alpha * red / 255) << 16) | ((alpha * green / 255) << 8) |
+                (alpha * blue / 255) | (alpha << 24);
     }
   }
   cairo_surface_mark_dirty(surface);
@@ -344,6 +357,7 @@ bool Document::open_pdf(const std::string& path, const std::string& password,
   dirty_ = destructive_changes_ = false;
   undo_.clear();
   redo_.clear();
+  ++revision_;
   return true;
 }
 
@@ -369,6 +383,7 @@ bool Document::open_image(const std::string& path, std::string& error) {
   dirty_ = destructive_changes_ = false;
   undo_.clear();
   redo_.clear();
+  ++revision_;
   return true;
 }
 
@@ -432,7 +447,7 @@ cairo_surface_t* Document::render_source(const PageRef& ref, double scale) const
 }
 
 cairo_surface_t* Document::render_page(std::size_t index, double scale,
-                                       bool annotations) const {
+                                       bool annotations, std::uint64_t skip_annotation_id) const {
   if (index >= pages_.size()) return nullptr;
   const PageRef& ref = pages_[index];
   cairo_surface_t* base = render_source(ref, scale);
@@ -458,7 +473,7 @@ cairo_surface_t* Document::render_page(std::size_t index, double scale,
     if (ref.secure_crop.active)
       cairo_translate(cr, -ref.secure_crop.rect.x * scale,
                       -ref.secure_crop.rect.y * scale);
-    draw_annotations(cr, ref, scale);
+    draw_annotations(cr, ref, scale, skip_annotation_id);
     cairo_destroy(cr);
   }
   if (ref.rotation != 0) {
@@ -490,10 +505,12 @@ cairo_surface_t* Document::render_page(std::size_t index, double scale,
   return base;
 }
 
-void Document::draw_annotations(cairo_t* cr, const PageRef& ref, double scale) const {
+void Document::draw_annotations(cairo_t* cr, const PageRef& ref, double scale,
+                                std::uint64_t skip_annotation_id) const {
   cairo_save(cr);
   cairo_scale(cr, scale, scale);
   for (const auto& a : ref.annotations) {
+    if (a.id == skip_annotation_id) continue;
     cairo_save(cr);
     cairo_set_line_width(cr, a.stroke_width);
     cairo_set_source_rgba(cr, a.stroke.red, a.stroke.green, a.stroke.blue, a.stroke.alpha);
@@ -501,8 +518,15 @@ void Document::draw_annotations(cairo_t* cr, const PageRef& ref, double scale) c
     switch (a.type) {
       case AnnotationType::Highlight:
         cairo_set_source_rgba(cr, a.fill.red, a.fill.green, a.fill.blue, a.fill.alpha);
-        cairo_rectangle(cr, b.x, b.y, b.width, b.height);
-        cairo_fill(cr);
+        if (!a.text_rects.empty()) {
+          for (const auto& rect : a.text_rects) {
+            cairo_rectangle(cr, rect.x, rect.y, rect.width, rect.height);
+            cairo_fill(cr);
+          }
+        } else {
+          cairo_rectangle(cr, b.x, b.y, b.width, b.height);
+          cairo_fill(cr);
+        }
         break;
       case AnnotationType::Rectangle:
         cairo_set_source_rgba(cr, a.fill.red, a.fill.green, a.fill.blue, a.fill.alpha);
@@ -543,25 +567,16 @@ void Document::draw_annotations(cairo_t* cr, const PageRef& ref, double scale) c
           cairo_stroke(cr);
         }
         break;
-      case AnnotationType::TextBox:
-        cairo_select_font_face(cr, a.font_family.empty() ? "Sans" : a.font_family.c_str(),
-                               CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, a.font_size);
-        {
-          cairo_font_extents_t font{};
-          cairo_font_extents(cr, &font);
-          std::istringstream input(a.text);
-          std::string line;
-          std::size_t line_number = 0;
-          while (std::getline(input, line)) {
-            cairo_move_to(cr, b.x + 4,
-                          b.y + 4 + font.ascent +
-                              line_number * std::max(font.height, a.font_size));
-            cairo_show_text(cr, line.c_str());
-            ++line_number;
-          }
-        }
+      case AnnotationType::TextBox: {
+        PangoLayout* layout = create_text_layout(cr, a, b.width);
+        cairo_save(cr);
+        cairo_translate(cr, b.x + 4.0, b.y + 4.0);
+        cairo_set_source_rgba(cr, a.stroke.red, a.stroke.green, a.stroke.blue, a.stroke.alpha);
+        pango_cairo_show_layout(cr, layout);
+        cairo_restore(cr);
+        g_object_unref(layout);
         break;
+      }
       case AnnotationType::Signature: {
         GError* error = nullptr;
         GdkPixbuf* signature = gdk_pixbuf_new_from_file(a.signature_path.c_str(), &error);
@@ -576,6 +591,222 @@ void Document::draw_annotations(cairo_t* cr, const PageRef& ref, double scale) c
     cairo_restore(cr);
   }
   cairo_restore(cr);
+}
+
+std::vector<Rect> Document::highlight_rects(std::size_t index, Point start,
+                                           Point end) const {
+  std::vector<Rect> result;
+  if (index >= pages_.size() || kind_ != Kind::Pdf) return result;
+  const auto& ref = pages_[index];
+  if (ref.rasterized || ref.secure_crop.active || ref.rotation != 0) return result;
+
+  if (!text_layout_cache_.empty() &&
+      text_layout_cache_.front().revision != revision_)
+    text_layout_cache_.clear();
+
+  const std::vector<Rect>* characters = nullptr;
+  for (const auto& entry : text_layout_cache_) {
+    if (entry.page == index) {
+      characters = &entry.rectangles;
+      break;
+    }
+  }
+  if (!characters) {
+    std::string ignored;
+    PopplerDocument* source = (pdf_ && ref.source_path == path_) ?
+        static_cast<PopplerDocument*>(g_object_ref(pdf_)) : load_pdf(ref.source_path, ignored);
+    if (!source) return result;
+    PopplerPage* page = poppler_document_get_page(source, ref.source_index);
+    if (!page) {
+      g_object_unref(source);
+      return result;
+    }
+    std::vector<Rect> layout;
+    PopplerRectangle* rectangles = nullptr;
+    guint count = 0;
+    if (poppler_page_get_text_layout(page, &rectangles, &count)) {
+      layout.reserve(count);
+      for (guint i = 0; i < count; ++i) {
+        const auto& r = rectangles[i];
+        const double left = std::min(r.x1, r.x2);
+        const double top = std::min(r.y1, r.y2);
+        const double width = std::abs(r.x2 - r.x1);
+        const double height = std::abs(r.y2 - r.y1);
+        if (width > 0.0 && height > 0.0)
+          layout.push_back({left, top, width, height});
+      }
+    }
+    g_free(rectangles);
+    g_object_unref(page);
+    g_object_unref(source);
+    if (text_layout_cache_.size() >= 4) text_layout_cache_.erase(text_layout_cache_.begin());
+    text_layout_cache_.push_back({index, revision_, std::move(layout)});
+    characters = &text_layout_cache_.back().rectangles;
+  }
+  if (characters->empty()) return result;
+
+  auto nearest_index = [&](Point point) {
+    std::size_t best = 0;
+    double best_score = std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < characters->size(); ++i) {
+      const auto& r = (*characters)[i];
+      const double dx = point.x < r.x ? r.x - point.x :
+                        point.x > r.x + r.width ? point.x - (r.x + r.width) : 0.0;
+      const double dy = point.y < r.y ? r.y - point.y :
+                        point.y > r.y + r.height ? point.y - (r.y + r.height) : 0.0;
+      // Prefer the nearest text line, then the nearest character on it.
+      const double score = dy * 10000.0 + dx;
+      if (score < best_score) {
+        best_score = score;
+        best = i;
+      }
+    }
+    return best;
+  };
+
+  std::size_t first = nearest_index(start);
+  std::size_t last = nearest_index(end);
+  if (first > last) std::swap(first, last);
+
+  struct Line {
+    double top{};
+    double bottom{};
+    double left{};
+    double right{};
+  };
+  std::vector<Line> lines;
+  for (std::size_t i = first; i <= last; ++i) {
+    const auto& r = (*characters)[i];
+    bool merged = false;
+    if (!lines.empty()) {
+      auto& line = lines.back();
+      const double line_height = line.bottom - line.top;
+      const double vertical_overlap = std::min(line.bottom, r.y + r.height) -
+                                     std::max(line.top, r.y);
+      const double horizontal_distance =
+          r.x + r.width < line.left ? line.left - (r.x + r.width) :
+          r.x > line.right ? r.x - line.right : 0.0;
+      const double allowed_gap = std::max(12.0, std::max(line_height, r.height) * 2.0);
+      if (vertical_overlap > std::min(line_height, r.height) * 0.5 &&
+          horizontal_distance <= allowed_gap) {
+        line.top = std::min(line.top, r.y);
+        line.bottom = std::max(line.bottom, r.y + r.height);
+        line.left = std::min(line.left, r.x);
+        line.right = std::max(line.right, r.x + r.width);
+        merged = true;
+      }
+    }
+    if (!merged)
+      lines.push_back({r.y, r.y + r.height, r.x, r.x + r.width});
+  }
+  for (const auto& line : lines) {
+    if (line.right > line.left && line.bottom > line.top)
+      result.push_back({line.left, line.top, line.right - line.left,
+                        line.bottom - line.top});
+  }
+  return result;
+}
+
+bool Document::erase_highlights(std::size_t page_index,
+                                const std::vector<Rect>& areas) {
+  if (page_index >= pages_.size() || areas.empty()) return false;
+  auto subtract = [](const Rect& rect, const Rect& area, std::vector<Rect>& out) {
+    const double overlap_left = std::max(rect.x, area.x);
+    const double overlap_right = std::min(rect.x + rect.width, area.x + area.width);
+    const double overlap_top = std::max(rect.y, area.y);
+    const double overlap_bottom = std::min(rect.y + rect.height, area.y + area.height);
+    if (overlap_right <= overlap_left || overlap_bottom <= overlap_top) {
+      if (rect.width > 0.0 && rect.height > 0.0) out.push_back(rect);
+      return;
+    }
+    auto add = [&](double x, double y, double width, double height) {
+      if (width > 0.25 && height > 0.25) out.push_back({x, y, width, height});
+    };
+    const double rect_bottom = rect.y + rect.height;
+    const double area_bottom = area.y + area.height;
+    const double rect_right = rect.x + rect.width;
+    const double area_right = area.x + area.width;
+    if (area.y > rect.y) add(rect.x, rect.y, rect.width, area.y - rect.y);
+    if (area_bottom < rect_bottom)
+      add(rect.x, area_bottom, rect.width, rect_bottom - area_bottom);
+    const double middle_top = std::max(rect.y, area.y);
+    const double middle_bottom = std::min(rect_bottom, area_bottom);
+    const double middle_height = middle_bottom - middle_top;
+    if (middle_height > 0.0) {
+      if (area.x > rect.x) add(rect.x, middle_top, area.x - rect.x, middle_height);
+      if (area_right < rect_right)
+        add(area_right, middle_top, rect_right - area_right, middle_height);
+    }
+  };
+  auto rects_equal = [](const std::vector<Rect>& left, const std::vector<Rect>& right) {
+    if (left.size() != right.size()) return false;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+      if (left[i].x != right[i].x || left[i].y != right[i].y ||
+          left[i].width != right[i].width || left[i].height != right[i].height)
+        return false;
+    }
+    return true;
+  };
+
+  std::vector<Annotation> kept;
+  kept.reserve(pages_[page_index].annotations.size());
+  bool changed_any = false;
+  for (auto& annotation : pages_[page_index].annotations) {
+    if (annotation.type != AnnotationType::Highlight) {
+      kept.push_back(annotation);
+      continue;
+    }
+    std::vector<Rect> remaining = annotation.text_rects;
+    if (remaining.empty()) remaining.push_back(annotation.bounds);
+    double original_area = 0.0;
+    for (const auto& rect : remaining)
+      original_area += std::max(0.0, rect.width) * std::max(0.0, rect.height);
+    bool changed = false;
+    for (const auto& area : areas) {
+      std::vector<Rect> next;
+      for (const auto& rect : remaining) subtract(rect, area, next);
+      if (!rects_equal(next, remaining)) changed = true;
+      remaining = std::move(next);
+      if (remaining.empty()) {
+        changed = true;
+        break;
+      }
+    }
+    if (!remaining.empty() && original_area > 0.0) {
+      double remaining_area = 0.0;
+      for (const auto& rect : remaining)
+        remaining_area += std::max(0.0, rect.width) * std::max(0.0, rect.height);
+      // Re-selecting nearly the same passage should remove the whole highlight
+      // instead of leaving thin edge slivers.
+      if (remaining_area <= original_area * 0.2) {
+        remaining.clear();
+        changed = true;
+      }
+    }
+    if (!changed) {
+      kept.push_back(annotation);
+      continue;
+    }
+    changed_any = true;
+    if (remaining.empty()) continue;
+    Rect bounds = remaining.front();
+    for (const auto& rect : remaining) {
+      const double right = std::max(bounds.x + bounds.width, rect.x + rect.width);
+      const double bottom = std::max(bounds.y + bounds.height, rect.y + rect.height);
+      bounds.x = std::min(bounds.x, rect.x);
+      bounds.y = std::min(bounds.y, rect.y);
+      bounds.width = right - bounds.x;
+      bounds.height = bottom - bounds.y;
+    }
+    annotation.text_rects = std::move(remaining);
+    annotation.bounds = bounds;
+    kept.push_back(annotation);
+  }
+  if (!changed_any) return false;
+  checkpoint();
+  pages_[page_index].annotations = std::move(kept);
+  changed();
+  return true;
 }
 
 std::string Document::page_text(std::size_t index) const {
@@ -601,9 +832,12 @@ void Document::checkpoint() {
   redo_.clear();
 }
 
+void Document::invalidate_rendering() { ++revision_; }
+
 void Document::changed(bool destructive) {
   dirty_ = true;
   destructive_changes_ = destructive_changes_ || destructive;
+  ++revision_;
 }
 
 bool Document::undo() {
@@ -613,6 +847,7 @@ bool Document::undo() {
   destructive_changes_ = undo_.back().destructive;
   undo_.pop_back();
   dirty_ = true;
+  ++revision_;
   return true;
 }
 
@@ -623,6 +858,7 @@ bool Document::redo() {
   destructive_changes_ = redo_.back().destructive;
   redo_.pop_back();
   dirty_ = true;
+  ++revision_;
   return true;
 }
 
@@ -702,6 +938,23 @@ bool Document::update_annotation(std::size_t page_index, std::uint64_t id,
   return true;
 }
 
+bool Document::move_annotation(std::size_t from_page, std::uint64_t id,
+                               std::size_t to_page, const Annotation& annotation) {
+  if (from_page >= pages_.size() || to_page >= pages_.size()) return false;
+  auto& source = pages_[from_page].annotations;
+  const auto found = std::find_if(source.begin(), source.end(),
+                                  [id](const Annotation& a) { return a.id == id; });
+  if (found == source.end()) return false;
+  Annotation moved = annotation;
+  moved.id = id;
+  if (moved.type == AnnotationType::TextBox)
+    moved.bounds = fit_text_bounds(moved);
+  source.erase(found);
+  pages_[to_page].annotations.push_back(std::move(moved));
+  changed();
+  return true;
+}
+
 void Document::begin_annotation_edit() {
   if (annotation_edit_open_) return;
   checkpoint();
@@ -711,6 +964,10 @@ void Document::begin_annotation_edit() {
 void Document::commit_annotation_edit() {
   if (!annotation_edit_open_) return;
   annotation_edit_open_ = false;
+  for (auto& page : pages_)
+    for (auto& annotation : page.annotations)
+      if (annotation.type == AnnotationType::TextBox)
+        annotation.bounds = fit_text_bounds(annotation);
   changed();
 }
 
@@ -871,7 +1128,18 @@ bool Document::write_pdf_annotations(const std::string& path, std::string& error
       switch (a.type) {
         case AnnotationType::Highlight:
           quads = g_array_new(FALSE, FALSE, sizeof(PopplerQuadrilateral));
-          g_array_append_val(quads, quad);
+          if (!a.text_rects.empty()) {
+            for (const auto& text_rect : a.text_rects) {
+              PopplerQuadrilateral text_quad{
+                {text_rect.x, ref.height_points - (text_rect.y + text_rect.height)},
+                {text_rect.x + text_rect.width, ref.height_points - (text_rect.y + text_rect.height)},
+                {text_rect.x, ref.height_points - text_rect.y},
+                {text_rect.x + text_rect.width, ref.height_points - text_rect.y}};
+              g_array_append_val(quads, text_quad);
+            }
+          } else {
+            g_array_append_val(quads, quad);
+          }
           annotation = poppler_annot_text_markup_new_highlight(document, &rect, quads);
           g_array_unref(quads);
           break;

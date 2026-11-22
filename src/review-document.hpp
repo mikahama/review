@@ -34,9 +34,15 @@ public:
   [[nodiscard]] bool dirty() const { return dirty_; }
   [[nodiscard]] bool destructive_changes() const { return destructive_changes_; }
   [[nodiscard]] bool read_only() const { return read_only_; }
+  [[nodiscard]] std::uint64_t revision() const { return revision_; }
+  void invalidate_rendering();
 
-  cairo_surface_t* render_page(std::size_t index, double scale, bool annotations = true) const;
+  cairo_surface_t* render_page(std::size_t index, double scale, bool annotations = true,
+                               std::uint64_t skip_annotation_id = 0) const;
   std::string page_text(std::size_t index) const;
+  [[nodiscard]] std::vector<Rect> highlight_rects(std::size_t index, Point start,
+                                                 Point end) const;
+  bool erase_highlights(std::size_t page_index, const std::vector<Rect>& areas);
 
   void checkpoint();
   bool undo();
@@ -49,6 +55,8 @@ public:
   void add_annotation(std::size_t page_index, Annotation annotation);
   bool update_annotation(std::size_t page_index, std::uint64_t id,
                          const Annotation& annotation);
+  bool move_annotation(std::size_t from_page, std::uint64_t id, std::size_t to_page,
+                       const Annotation& annotation);
   bool remove_annotation(std::size_t page_index, std::uint64_t id);
   void begin_annotation_edit();
   void commit_annotation_edit();
@@ -71,7 +79,8 @@ private:
   PopplerDocument* load_pdf(const std::string& path, std::string& error,
                             const std::string& password = {}) const;
   cairo_surface_t* render_source(const PageRef& ref, double scale) const;
-  void draw_annotations(cairo_t* cr, const PageRef& ref, double scale) const;
+  void draw_annotations(cairo_t* cr, const PageRef& ref, double scale,
+                        std::uint64_t skip_annotation_id = 0) const;
   bool create_image_pdf(const PageRef& ref, const std::string& destination,
                         bool include_annotations, std::string& error) const;
   bool assemble_pdf(const std::string& destination, bool flatten,
@@ -92,6 +101,13 @@ private:
   bool dirty_{};
   bool destructive_changes_{};
   bool read_only_{};
+  std::uint64_t revision_{1};
+  struct TextLayoutCache {
+    std::size_t page{};
+    std::uint64_t revision{};
+    std::vector<Rect> rectangles;
+  };
+  mutable std::vector<TextLayoutCache> text_layout_cache_{};
   bool annotation_edit_open_{};
   std::uint64_t next_annotation_id_{1};
   std::filesystem::path session_dir_{};
